@@ -1,16 +1,15 @@
-"""Smart model routing layer for Hermes Agent.
+"""Small, deterministic model-selection engine.
 
-This module intentionally sits above Hermes' existing provider/model
-resolution machinery. It does not replace provider discovery, credential
-rotation, retry, cooldown, or fallback infrastructure.
+Smart Inference decides *which* Hermes model should handle a request. Hermes
+still owns provider discovery, credentials, transport, retries, fallback,
+streaming, and execution.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from time import monotonic
-from typing import Any, Iterable
+from typing import Iterable
 
 
 class CostPolicy(str, Enum):
@@ -19,207 +18,180 @@ class CostPolicy(str, Enum):
     ANY = "any"
 
 
-class TaskClass(str, Enum):
+class Task(str, Enum):
     CODING = "coding"
     REASONING = "reasoning"
     RESEARCH = "research"
-    LONG_CONTEXT = "long_context"
+    FINANCIAL = "financial"
     VISION = "vision"
-    CASUAL = "casual"
     GENERAL = "general"
 
 
 @dataclass(frozen=True)
-class ModelCandidate:
-    """Normalized model metadata consumed by the router.
+class Requirements:
+    reasoning: bool = False
+    coding: bool = False
+    research: bool = False
+    financial: bool = False
+    vision: bool = False
+    tools: bool = False
+    structured_output: bool = False
+    long_context: bool = False
+    min_context: int | None = None
 
-    The router deliberately accepts plain metadata rather than owning a
-    second provider catalog. Callers can populate these records from
-    Hermes' existing model metadata/discovery systems.
-    """
 
+@dataclass(frozen=True)
+class InferenceRequest:
+    prompt: str
+    requirements: Requirements | None = None
+    cost_policy: CostPolicy = CostPolicy.FREE_ONLY
+
+
+@dataclass(frozen=True)
+class ModelRef:
     provider: str
     model: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+
+@dataclass(frozen=True)
+class ModelCandidate:
+    ref: ModelRef
     free: bool = False
-    context_length: int | None = None
-    supports_tools: bool = False
-    supports_vision: bool = False
-    supports_reasoning: bool = False
+    context_window: int | None = None
+    reasoning: bool = False
+    tools: bool = False
+    vision: bool = False
+    structured_output: bool = False
     quality: float = 0.5
     coding: float = 0.5
     research: float = 0.5
-    latency_score: float = 0.5
-    reliability_score: float = 0.5
-    extra: dict[str, Any] = field(default_factory=dict)
+    financial: float = 0.5
 
 
 @dataclass(frozen=True)
-class RoutingRequest:
-    prompt: str
-    cost_policy: CostPolicy = CostPolicy.FREE_ONLY
-    requires_tools: bool = False
-    requires_vision: bool = False
-    requires_reasoning: bool = False
-    min_context_length: int | None = None
-    task_class: TaskClass | None = None
-
-
-@dataclass(frozen=True)
-class RoutingDecision:
-    task_class: TaskClass
-    primary: ModelCandidate
-    fallbacks: tuple[ModelCandidate, ...]
+class InferenceDecision:
+    task: Task
+    requirements: Requirements
+    primary: ModelRef
+    ranked: tuple[ModelRef, ...]
     scores: dict[str, float]
 
     @property
-    def chain(self) -> tuple[ModelCandidate, ...]:
-        return (self.primary, *self.fallbacks)
+    def fallbacks(self) -> tuple[ModelRef, ...]:
+        return self.ranked[1:]
 
 
-@dataclass
-class _Health:
-    successes: int = 0
-    failures: int = 0
-    latency_total: float = 0.0
-
-    @property
-    def success_rate(self) -> float:
-        total = self.successes + self.failures
-        return self.successes / total if total else 0.5
-
-    @property
-    def latency_score(self) -> float:
-        if not self.successes:
-            return 0.5
-        avg = self.latency_total / self.successes
-        return 1.0 / (1.0 + avg)
+def _has_any(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
 
 
-class SmartRouter:
-    """Task-aware model selector built on top of Hermes model discovery."""
+class SmartInference:
+    """Pure decision engine; no provider/runtime ownership."""
 
-    def __init__(self) -> None:
-        self._health: dict[tuple[str, str], _Health] = {}
-
-    def observe(
-        self,
-        candidate: ModelCandidate,
-        *,
-        success: bool,
-        latency_seconds: float | None = None,
-    ) -> None:
-        health = self._health.setdefault((candidate.provider, candidate.model), _Health())
-        if success:
-            health.successes += 1
-            if latency_seconds is not None:
-                health.latency_total += max(0.0, latency_seconds)
-        else:
-            health.failures += 1
-
-    def classify(self, prompt: str) -> TaskClass:
+    def classify(self, prompt: str) -> Task:
         text = prompt.lower()
-        coding = (
-            "```" in text
-            or any(x in text for x in ("code", "python", "typescript", "bug", "compile", "function", "api"))
-        )
-        research = any(x in text for x in ("research", "sources", "cite", "compare", "investigate", "latest"))
-        reasoning = any(x in text for x in ("prove", "derive", "analyze", "reason", "why", "solve"))
-        vision = any(x in text for x in ("image", "photo", "screenshot", "picture", "vision"))
-        long_context = any(x in text for x in ("long document", "entire repository", "whole codebase", "large context"))
+        if _has_any(text, ("screenshot", "image", "photo", "picture", "vision")):
+            return Task.VISION
+        if _has_any(text, ("xauusd", "forex", "trading", "trade", "market", "ohlc", "position")):
+            return Task.FINANCIAL
+        if _has_any(text, ("research", "sources", "cite", "investigate", "latest", "compare")):
+            return Task.RESEARCH
+        if _has_any(text, ("code", "python", "typescript", "javascript", "bug", "compile", "function", "repo", "repository", "api")):
+            return Task.CODING
+        if _has_any(text, ("prove", "derive", "analyze", "analyse", "reason", "why", "solve", "architecture")):
+            return Task.REASONING
+        return Task.GENERAL
 
-        if vision:
-            return TaskClass.VISION
-        if coding:
-            return TaskClass.CODING
-        if research:
-            return TaskClass.RESEARCH
-        if long_context:
-            return TaskClass.LONG_CONTEXT
-        if reasoning:
-            return TaskClass.REASONING
-        if len(text.split()) < 20:
-            return TaskClass.CASUAL
-        return TaskClass.GENERAL
+    def infer_requirements(self, prompt: str, task: Task | None = None) -> Requirements:
+        text = prompt.lower()
+        task = task or self.classify(prompt)
+        return Requirements(
+            reasoning=task in {Task.REASONING, Task.CODING, Task.RESEARCH, Task.FINANCIAL}
+            or _has_any(text, ("reason", "analyze", "analyse", "explain why", "evaluate")),
+            coding=task is Task.CODING,
+            research=task is Task.RESEARCH or _has_any(text, ("sources", "citations", "web research")),
+            financial=task is Task.FINANCIAL,
+            vision=task is Task.VISION,
+            tools=_has_any(text, ("use a tool", "use tools", "call an api", "browse", "search the web", "run a command")),
+            structured_output=_has_any(text, ("json", "structured output", "schema", "return a table")),
+            long_context=_has_any(text, ("whole repository", "entire repository", "whole codebase", "large document", "long context", "entire codebase")),
+        )
 
     def filter_candidates(
         self,
         candidates: Iterable[ModelCandidate],
-        request: RoutingRequest,
+        request: InferenceRequest,
+        requirements: Requirements,
     ) -> list[ModelCandidate]:
         result: list[ModelCandidate] = []
         for candidate in candidates:
             if request.cost_policy is CostPolicy.FREE_ONLY and not candidate.free:
                 continue
-            if request.requires_tools and not candidate.supports_tools:
+            if requirements.reasoning and not candidate.reasoning:
                 continue
-            if request.requires_vision and not candidate.supports_vision:
+            if requirements.coding and candidate.coding <= 0:
                 continue
-            if request.requires_reasoning and not candidate.supports_reasoning:
+            if requirements.research and candidate.research <= 0:
                 continue
-            if (
-                request.min_context_length is not None
-                and (candidate.context_length or 0) < request.min_context_length
-            ):
+            if requirements.financial and candidate.financial <= 0:
+                continue
+            if requirements.vision and not candidate.vision:
+                continue
+            if requirements.tools and not candidate.tools:
+                continue
+            if requirements.structured_output and not candidate.structured_output:
+                continue
+            if requirements.min_context is not None and (candidate.context_window or 0) < requirements.min_context:
+                continue
+            if requirements.long_context and (candidate.context_window or 0) < 100_000:
                 continue
             result.append(candidate)
         return result
 
-    def score(self, candidate: ModelCandidate, task: TaskClass) -> float:
-        health = self._health.get((candidate.provider, candidate.model))
-        reliability = health.success_rate if health else candidate.reliability_score
-        latency = health.latency_score if health else candidate.latency_score
-
+    def score(self, candidate: ModelCandidate, task: Task, policy: CostPolicy) -> float:
         task_fit = {
-            TaskClass.CODING: candidate.coding,
-            TaskClass.RESEARCH: candidate.research,
-            TaskClass.REASONING: candidate.supports_reasoning * 0.5 + candidate.quality * 0.5,
-            TaskClass.VISION: float(candidate.supports_vision),
-            TaskClass.LONG_CONTEXT: min((candidate.context_length or 0) / 200_000, 1.0),
-            TaskClass.CASUAL: candidate.quality,
-            TaskClass.GENERAL: candidate.quality,
+            Task.CODING: candidate.coding,
+            Task.RESEARCH: candidate.research,
+            Task.FINANCIAL: candidate.financial,
+            Task.REASONING: 1.0 if candidate.reasoning else 0.0,
+            Task.VISION: 1.0 if candidate.vision else 0.0,
+            Task.GENERAL: candidate.quality,
         }[task]
+        context_bonus = min((candidate.context_window or 0) / 200_000, 1.0)
+        free_bonus = 0.15 if policy is CostPolicy.FREE_PREFERRED and candidate.free else 0.0
+        return 0.55 * task_fit + 0.30 * candidate.quality + 0.15 * context_bonus + free_bonus
 
-        # Quality/task fit dominate; reliability and latency adapt over time.
-        return (
-            0.40 * task_fit
-            + 0.25 * candidate.quality
-            + 0.20 * reliability
-            + 0.15 * latency
-        )
-
-    def route(
-        self,
-        request: RoutingRequest,
-        candidates: Iterable[ModelCandidate],
-    ) -> RoutingDecision:
-        task = request.task_class or self.classify(request.prompt)
-        filtered = self.filter_candidates(candidates, request)
+    def choose(self, request: InferenceRequest, candidates: Iterable[ModelCandidate]) -> InferenceDecision:
+        task = self.classify(request.prompt)
+        requirements = request.requirements or self.infer_requirements(request.prompt, task)
+        filtered = self.filter_candidates(candidates, request, requirements)
         if not filtered:
-            raise LookupError("No model satisfies the smart-routing policy and capabilities")
+            raise LookupError("No model satisfies the inferred requirements and cost policy")
 
-        ranked = sorted(
+        ranked_candidates = sorted(
             filtered,
-            key=lambda c: self.score(c, task),
+            key=lambda candidate: self.score(candidate, task, request.cost_policy),
             reverse=True,
         )
         scores = {
-            f"{c.provider}/{c.model}": self.score(c, task)
-            for c in ranked
+            candidate.ref.key: self.score(candidate, task, request.cost_policy)
+            for candidate in ranked_candidates
         }
-        return RoutingDecision(task, ranked[0], tuple(ranked[1:]), scores)
-
-    def discover_models(self, provider: str, *, force_refresh: bool = False) -> list[str]:
-        """Delegate discovery to Hermes' canonical model catalog machinery."""
-        from hermes_cli.models import provider_model_ids
-
-        return provider_model_ids(provider, force_refresh=force_refresh)
+        ranked = tuple(candidate.ref for candidate in ranked_candidates)
+        return InferenceDecision(task, requirements, ranked[0], ranked, scores)
 
 
 __all__ = [
     "CostPolicy",
+    "InferenceDecision",
+    "InferenceRequest",
     "ModelCandidate",
-    "RoutingDecision",
-    "RoutingRequest",
-    "SmartRouter",
-    "TaskClass",
+    "ModelRef",
+    "Requirements",
+    "SmartInference",
+    "Task",
 ]
