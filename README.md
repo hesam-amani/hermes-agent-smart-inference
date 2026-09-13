@@ -1,35 +1,71 @@
-# Hermes Agent Smart Router
+# Smart Inference
 
-Task-aware model selection for Hermes Agent.
+A small decision engine for automatic model selection in Hermes Agent.
 
-## Architecture
+## Purpose
 
-The router is intentionally a decision layer above Hermes' existing provider runtime:
+Smart Inference answers one question:
+
+> **Given this request and the models Hermes already knows about, which model should handle it?**
 
 ```text
 request
-  -> task classification
-  -> capability filtering
-  -> cost/entitlement policy
-  -> runtime health
-  -> model ranking
-  -> primary + fallback candidates
-  -> Hermes model/provider activation
-  -> existing retry/fallback execution
+  ↓
+Smart Inference
+  ├─ classify task
+  ├─ infer requirements
+  ├─ filter capabilities
+  └─ rank candidates
+  ↓
+provider + model
+  ↓
+Hermes executes
 ```
 
-The router does **not** own provider clients, credentials, retry logic, cooldowns, or a second model catalog.
+The public API is intentionally small:
 
-## Current status
+```python
+decision = inference.choose(request, candidates)
+```
 
-- `agent/smart_router.py` — core task/capability/cost/health ranking engine.
-- `agent/hermes_adapter.py` — adapter for Hermes-style model metadata and discovery.
-- `tests/test_smart_router.py` — core routing coverage.
+The result contains a primary `provider/model` and a ranked list of alternatives.
 
-Hermes already exposes `smart_model_routing` as a configuration surface, while its current provider/model machinery remains the canonical source for model discovery and activation. The next upstream-facing step is a small core integration that invokes this decision layer at the automatic model-selection boundary and hands the resulting provider/model back to Hermes' existing resolver.
+## Boundary
 
-### Safety invariant
+Smart Inference does **not** own:
 
-`FREE_ONLY` requires an explicit free entitlement. Missing pricing metadata is **not** treated as free.
+- provider clients or API calls
+- credentials
+- transport
+- retries or cooldowns
+- streaming
+- provider fallback execution
+- a second model catalog
+- a daemon, gateway, database, embeddings, or RAG system
 
-Explicit user model selection remains authoritative; automatic routing must never silently override an explicit `/model` choice.
+Hermes remains the runtime and source of truth for provider/model discovery and
+capabilities. The Hermes adapter only translates that existing metadata into the
+small candidate shape consumed by the decision engine.
+
+## Requirements, not one-label routing
+
+A request can require several capabilities at once:
+
+```text
+coding + reasoning + long_context
+```
+
+rather than being forced into a single `CODING` or `REASONING` bucket.
+
+Hard requirements filter candidates first. Ranking then considers task fit,
+model quality, and context capacity.
+
+## Integration seam
+
+Hermes already has a shared model-switch/resolution pipeline. Smart Inference
+should sit immediately before that pipeline and return a plain provider/model
+selection. Hermes then performs its normal provider resolution, credential
+handling, API-mode selection, and execution.
+
+Explicit `/model` selections remain authoritative; automatic inference must
+never silently replace an explicit user choice.
