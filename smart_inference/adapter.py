@@ -1,17 +1,37 @@
-"""Hermes-neutral adapter helpers for Smart Inference."""
+"""Adapters from external model metadata into Smart Inference candidates.
+
+This module deliberately knows nothing about Hermes runtime state, clients,
+credentials, transports, retries, or fallback behavior.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from .router import ModelCandidate, ModelRef
 
 
-def _value(metadata: Any, name: str, default: Any = None) -> Any:
-    if isinstance(metadata, Mapping):
-        return metadata.get(name, default)
-    return getattr(metadata, name, default)
+def _number(metadata: Any, name: str, default: float = 0.0) -> float:
+    value = getattr(metadata, name, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text(metadata: Any, *names: str) -> str:
+    values: list[str] = []
+
+    for name in names:
+        value = getattr(metadata, name, None)
+        if value:
+            values.append(str(value))
+
+    return " ".join(values).lower()
+
+
+def _contains(text: str, *terms: str) -> bool:
+    return any(term in text for term in terms)
 
 
 def candidate_from_metadata(
@@ -21,31 +41,86 @@ def candidate_from_metadata(
     *,
     free: bool = False,
 ) -> ModelCandidate:
-    context = _value(metadata, "context_window")
-    try:
-        context = int(context) if context is not None else None
-    except (TypeError, ValueError):
-        context = None
+    """Convert provider/model metadata into a Smart Inference candidate.
 
-    modalities = tuple(_value(metadata, "input_modalities", ()) or ())
-    name = f"{provider}/{model}".lower()
-    family = str(_value(metadata, "family", "") or "").lower()
+    Hermes currently exposes strong capability metadata for things such as
+    reasoning, tools, vision, structured output and context size.
 
-    # Hermes ModelInfo does not claim task-specific quality scores. These are
-    # deliberately conservative priors, not fabricated provider metadata.
-    coding = 0.75 if any(x in name or x in family for x in ("coder", "code", "dev")) else 0.25
-    research = 0.70 if any(x in name or x in family for x in ("research", "reason", "thinking")) else 0.25
-    financial = 0.55 if any(x in name for x in ("finance", "financial", "trader")) else 0.20
-    quality = 0.65 if bool(_value(metadata, "reasoning", False)) else 0.50
+    Coding/research/financial/quality are intentionally conservative heuristic
+    priors because they are not first-class Hermes ModelInfo capabilities.
+    """
+
+    model_text = _text(
+        metadata,
+        "id",
+        "name",
+        "family",
+        "provider_id",
+    )
+
+    context_window = int(
+        _number(
+            metadata,
+            "context_window",
+            _number(metadata, "max_input", 0.0),
+        )
+    )
+
+    reasoning = bool(getattr(metadata, "reasoning", False))
+    tools = bool(getattr(metadata, "tool_call", False))
+    vision = bool(getattr(metadata, "attachment", False))
+
+    modalities = getattr(metadata, "input_modalities", None)
+    if modalities:
+        try:
+            modality_text = " ".join(str(item).lower() for item in modalities)
+            vision = vision or "image" in modality_text
+        except TypeError:
+            pass
+
+    structured_output = bool(
+        getattr(metadata, "structured_output", False)
+    )
+
+    # Conservative model-family priors.
+    coding = 0.75 if _contains(
+        model_text,
+        "coder",
+        "coding",
+        "code",
+        "dev",
+        "developer",
+    ) else 0.25
+
+    research = 0.70 if _contains(
+        model_text,
+        "research",
+        "reason",
+        "thinking",
+        "think",
+    ) else 0.25
+
+    financial = 0.55 if _contains(
+        model_text,
+        "finance",
+        "financial",
+        "trader",
+        "trading",
+    ) else 0.20
+
+    quality = 0.65 if reasoning else 0.50
 
     return ModelCandidate(
-        ref=ModelRef(provider=provider, model=model),
+        ref=ModelRef(
+            provider=str(provider),
+            model=str(model),
+        ),
         free=free,
-        context_window=context,
-        reasoning=bool(_value(metadata, "reasoning", False)),
-        tools=bool(_value(metadata, "tool_call", False)),
-        vision=bool(_value(metadata, "attachment", False) or "image" in modalities),
-        structured_output=bool(_value(metadata, "structured_output", False)),
+        context_window=context_window,
+        reasoning=reasoning,
+        tools=tools,
+        vision=vision,
+        structured_output=structured_output,
         quality=quality,
         coding=coding,
         research=research,
@@ -53,4 +128,10 @@ def candidate_from_metadata(
     )
 
 
-__all__ = ["candidate_from_metadata"]
+def metadata_is_free(metadata: Any) -> bool:
+    """Return True only when Hermes explicitly reports zero input/output cost."""
+
+    input_cost = _number(metadata, "cost_input")
+    output_cost = _number(metadata, "cost_output")
+
+    return input_cost == 0.0 and output_cost == 0.0

@@ -1,5 +1,6 @@
-"""Public package for Hermes Smart Inference."""
+"""Small, provider-neutral Smart Inference engine."""
 
+from .adapter import candidate_from_metadata
 from .router import (
     CostPolicy,
     InferenceDecision,
@@ -21,5 +22,6 @@ __all__ = [
     "Requirements",
     "SmartInference",
     "Task",
+    "candidate_from_metadata",
     "choose",
 ]
